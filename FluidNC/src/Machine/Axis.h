@@ -36,6 +36,7 @@ namespace Machine {
         float _maxTravel    = 1000.0f;
         bool  _softLimits   = false;
         bool  _idleDisable  = true;
+        float _backlash     = 0.0f;  // backlash compensation in mm (0 = disabled)
 
         // Configuration system helpers:
         void group(Configuration::HandlerBase& handler) override;

@@ -16,6 +16,7 @@
 #    include "System.h"
 #    include "Driver/Console.h"
 #    include "MotionControl.h"
+#    include "Stepper.h"
 #    include "Platform.h"
 #    include "StartupLog.h"
 #    include "Module.h"
@@ -119,6 +120,7 @@ void setup() {
         config->_userInputs->init();
 
         Axes::init();
+        Stepper::init_backlash();
 
         config->_control->init();
 

@@ -30,6 +30,9 @@ namespace Stepper {
     // Reset the stepper subsystem variables
     void reset();
 
+    // Initialize backlash compensation from axis config
+    void init_backlash();
+
     // Changes the run state of the step segment buffer to execute the special parking motion.
     void parking_setup_buffer();
 

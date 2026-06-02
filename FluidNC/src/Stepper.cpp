@@ -32,6 +32,7 @@ struct st_block_t {
     uint32_t step_event_count;
     AxisMask direction_bits;
     bool     is_pwm_rate_adjusted;  // Tracks motions that require constant laser power/rate
+    uint32_t backlash_steps[MAX_N_AXIS];  // AMASS-scaled backlash steps; 0 = no compensation
 };
 static volatile st_block_t* st_block_buffer = nullptr;
 
@@ -70,10 +71,11 @@ typedef struct {
     AxisMask dir_outbits;
     uint32_t steps[MAX_N_AXIS];
 
-    uint16_t             step_count;        // Steps remaining in line segment motion
-    uint8_t              exec_block_index;  // Tracks the current st_block index. Change indicates new block.
-    volatile st_block_t* exec_block;        // Pointer to the block data for the segment being executed
-    volatile segment_t*  exec_segment;      // Pointer to the segment being executed
+    uint32_t             step_count;               // Steps remaining in line segment motion (widened for backlash)
+    uint32_t             backlash_ticks_remaining;  // ISR ticks remaining in backlash phase
+    uint8_t              exec_block_index;           // Tracks the current st_block index. Change indicates new block.
+    volatile st_block_t* exec_block;                 // Pointer to the block data for the segment being executed
+    volatile segment_t*  exec_segment;               // Pointer to the segment being executed
 } stepper_t;
 static stepper_t st;
 
@@ -86,6 +88,11 @@ static uint32_t          segment_next_head;
 // main program. Pointers may be planning segments or planner blocks ahead of what being executed.
 static plan_block_t*        pl_block;       // Pointer to the planner block being prepped
 static volatile st_block_t* st_prep_block;  // Pointer to the stepper block data being prepped
+
+// Backlash compensation state (written only by prep_buffer / init_backlash, never from ISR)
+static AxisMask  last_dir_bits                    = 0;
+static bool      dir_valid                        = false;
+static uint32_t  backlash_steps_cfg[MAX_N_AXIS]   = {};
 
 // Segment preparation data struct. Contains all the necessary information to compute new segments
 // based on the current executing planner block.
@@ -221,6 +228,17 @@ bool IRAM_ATTR Stepper::pulse_func() {
                 for (axis_t axis = X_AXIS; axis < n_axis; axis++) {
                     st.counter[axis] = st.exec_block->step_event_count >> 1;
                 }
+                // Backlash: extend this segment's step count by the backlash tick budget
+                {
+                    uint32_t max_bl = 0;
+                    for (axis_t axis = X_AXIS; axis < n_axis; axis++) {
+                        uint32_t bl = st.exec_block->backlash_steps[axis]
+                                      >> (maxAmassLevel - st.exec_segment->amass_level);
+                        if (bl > max_bl) max_bl = bl;
+                    }
+                    st.backlash_ticks_remaining = max_bl;
+                    st.step_count += max_bl;
+                }
             }
 
             st.dir_outbits = st.exec_block->direction_bits;
@@ -248,12 +266,26 @@ bool IRAM_ATTR Stepper::pulse_func() {
     }
 
     for (axis_t axis = X_AXIS; axis < n_axis; axis++) {
-        // Execute step displacement profile by Bresenham line algorithm
-        st.counter[axis] += st.steps[axis];
-        if (st.counter[axis] > st.exec_block->step_event_count) {
-            set_bitnum(st.step_outbits, axis);
-            st.counter[axis] -= st.exec_block->step_event_count;
+        if (st.backlash_ticks_remaining > 0) {
+            // Backlash phase: only step reversed axes at Bresenham rate; freeze others
+            if (st.exec_block->backlash_steps[axis] > 0) {
+                st.counter[axis] += st.steps[axis];
+                if (st.counter[axis] > st.exec_block->step_event_count) {
+                    set_bitnum(st.step_outbits, axis);
+                    st.counter[axis] -= st.exec_block->step_event_count;
+                }
+            }
+        } else {
+            // Normal Bresenham
+            st.counter[axis] += st.steps[axis];
+            if (st.counter[axis] > st.exec_block->step_event_count) {
+                set_bitnum(st.step_outbits, axis);
+                st.counter[axis] -= st.exec_block->step_event_count;
+            }
         }
+    }
+    if (st.backlash_ticks_remaining > 0) {
+        st.backlash_ticks_remaining--;
     }
 
     st.step_count--;  // Decrement step events count
@@ -306,6 +338,19 @@ void Stepper::reset() {
     st.step_outbits     = 0;
     st.dir_outbits      = 0;  // Initialize direction bits to default.
     // TODO do we need to turn step pins off?
+    dir_valid = false;
+}
+
+void Stepper::init_backlash() {
+    auto n_axis = Axes::_numberAxis;
+    for (axis_t axis = X_AXIS; axis < n_axis; axis++) {
+        auto a = Axes::_axis[axis];
+        backlash_steps_cfg[axis] = (a && a->_backlash > 0.0f)
+            ? uint32_t(a->_backlash * a->_stepsPerMm + 0.5f)
+            : 0;
+    }
+    dir_valid     = false;
+    last_dir_bits = 0;
 }
 
 // Called by planner_recalculate() when the executing block is updated by the new plan.
@@ -416,6 +461,30 @@ void Stepper::prep_buffer() {
                     st_prep_block->steps[axis] = pl_block->steps[axis] << maxAmassLevel;
                 }
                 st_prep_block->step_event_count = pl_block->step_event_count << maxAmassLevel;
+
+                // Backlash compensation: detect direction reversals and set per-axis extra steps
+                // Only update last_dir_bits for axes that actually move in this block so that
+                // intervening moves on other axes don't erase the remembered direction.
+                {
+                    auto n_axis_bl = Axes::_numberAxis;
+                    for (axis_t axis = X_AXIS; axis < n_axis_bl; axis++) {
+                        bool moving   = pl_block->steps[axis] > 0;
+                        bool reversed = moving
+                                     && dir_valid
+                                     && backlash_steps_cfg[axis] > 0
+                                     && bitnum_is_true(pl_block->direction_bits ^ last_dir_bits, axis);
+                        st_prep_block->backlash_steps[axis] =
+                            reversed ? (backlash_steps_cfg[axis] << maxAmassLevel) : 0;
+                        if (moving) {
+                            if (bitnum_is_true(pl_block->direction_bits, axis)) {
+                                set_bitnum(last_dir_bits, axis);
+                            } else {
+                                clear_bitnum(last_dir_bits, axis);
+                            }
+                        }
+                    }
+                    dir_valid = true;
+                }
 
                 // Initialize segment buffer data for generating the segments.
                 prep.steps_remaining  = (float)pl_block->step_event_count;

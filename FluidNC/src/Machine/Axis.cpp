@@ -12,6 +12,7 @@ namespace Machine {
         handler.item("max_travel_mm", _maxTravel, 0.1, 10000000.0);
         handler.item("soft_limits", _softLimits);
         handler.item("idle_disable", _idleDisable);
+        handler.item("backlash_mm", _backlash, 0.0, 10.0);
         handler.section("homing", _homing);
 
         char tmp[7];
