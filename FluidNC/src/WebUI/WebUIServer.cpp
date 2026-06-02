@@ -570,6 +570,7 @@ namespace WebUI {
         if (hash.length()) {
             response->addHeader("ETag", hash.c_str());
         }
+        response->addHeader("Cache-Control", "no-cache, no-store, must-revalidate");
         // content length is set automatically
         // response->setContentLength(file->size());
         if (isGzip) {
