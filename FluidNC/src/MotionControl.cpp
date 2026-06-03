@@ -202,9 +202,12 @@ void mc_arc(float*            target,
 
         // --- Arc backlash correction setup ---
         // For each quadrant crossing within the arc's angular range, we distribute the
-        // backlash correction over a 5° spread immediately after the crossing.  This fills
-        // the drive's dead zone smoothly while Y (or X) continues at full velocity.
-        static const float kBLSpread = (5.0f / 180.0f) * float(M_PI);  // 5° in radians
+        // backlash correction spread over 90° (full quadrant) after each crossing.  The
+        // correction is so gradual it is invisible: max path deviation = backlash/2 at the
+        // midpoint, which is far less than the flat spot the correction is eliminating.
+        // Adjacent crossings on the same axis are 180° apart, so the 90° spread from each
+        // never overlaps — it ends exactly at the next crossing of that axis.
+        static const float kBLSpread = float(M_PI) * 0.5f;  // 90° in radians
         static const int   kMaxCross = 16;
         struct ArcBLCrossing { float angle; int plane_idx; float correction; float prev_frac; };
         ArcBLCrossing crossings[kMaxCross];
@@ -301,8 +304,8 @@ void mc_arc(float*            target,
                 position[i] += linear_per_segment[i];
             }
 
-            // Arc backlash: apply incremental correction in the post-crossing spread zone.
-            // Each segment in [crossing, crossing+kBLSpread] gets a half-sine slice of backlash_mm.
+            // Arc backlash: apply incremental correction spread over 90° after each crossing.
+            // Each segment in [crossing, crossing+90°] gets a half-cosine slice of backlash_mm.
             if (num_cross > 0) {
                 float seg_angle = start_angle + float(i) * theta_per_segment;
                 float tps_sign  = (theta_per_segment > 0.0f) ? 1.0f : -1.0f;
