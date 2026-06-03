@@ -94,6 +94,15 @@ static AxisMask  last_dir_bits                    = 0;
 static bool      dir_valid                        = false;
 static uint32_t  backlash_steps_cfg[MAX_N_AXIS]   = {};
 
+// ZV input shaping state (written only by prep_buffer / init_input_shaping, never from ISR)
+static bool  zv_enabled = false;
+static float zv_A1      = 0.5f;
+static float zv_A2      = 0.5f;
+static int   zv_N       = 0;
+static float zv_buf[ZV_BUF_MAX];
+static int   zv_head    = 0;
+static int   zv_filled  = 0;
+
 // Set true during mc_arc() so planner-level arc correction handles backlash instead
 bool in_arc_move = false;
 
@@ -369,6 +378,39 @@ void Stepper::init_backlash() {
     }
     dir_valid     = false;
     last_dir_bits = 0;
+    Stepper::init_input_shaping();
+}
+
+void Stepper::init_input_shaping() {
+    zv_enabled = false;
+    float  f_best = 0.0f, z_best = 0.05f;
+    auto   n_axis = Axes::_numberAxis;
+    for (axis_t a = X_AXIS; a < n_axis; a++) {
+        auto ax = Axes::_axis[a];
+        if (ax && ax->_shaping_freq_hz > 0.0f) {
+            if (!zv_enabled || ax->_shaping_freq_hz < f_best) {
+                f_best     = ax->_shaping_freq_hz;
+                z_best     = ax->_shaping_zeta;
+                zv_enabled = true;
+            }
+        }
+    }
+    if (!zv_enabled) {
+        return;
+    }
+    float sq       = sqrtf(1.0f - z_best * z_best);
+    float K        = expf(-z_best * float(M_PI) / sq);
+    zv_A1          = 1.0f / (1.0f + K);
+    zv_A2          = K / (1.0f + K);
+    // T_d in minutes: half-period of damped natural frequency
+    float T_d_min  = 1.0f / (2.0f * f_best * sq * 60.0f);
+    zv_N           = int(T_d_min / DT_SEGMENT + 0.5f);
+    if (zv_N < 1)        { zv_N = 1; }
+    if (zv_N > ZV_BUF_MAX) { zv_N = ZV_BUF_MAX; }
+    memset(zv_buf, 0, sizeof(zv_buf));
+    zv_head   = 0;
+    zv_filled = 0;
+    log_info("ZV shaping: f=" << f_best << "Hz zeta=" << z_best << " N=" << zv_N << " A1=" << zv_A1);
 }
 
 // Called by planner_recalculate() when the executing block is updated by the new plan.
@@ -996,6 +1038,22 @@ void Stepper::prep_buffer() {
         }
         prep_segment->amass_level = level;
         prep_segment->n_step <<= level;
+
+        // ZV input shaping: scale step rate so v_out = A1*v_now + A2*v(t-T_d)
+        // n_step (position) is unchanged; only timing is shaped.
+        if (zv_enabled && prep.current_speed > 0.0f) {
+            float v_now     = prep.current_speed;
+            float v_old     = zv_buf[zv_head];   // oldest entry = T_d ago when fully filled
+            zv_buf[zv_head] = v_now;
+            zv_head         = (zv_head + 1 >= zv_N) ? 0 : zv_head + 1;
+            if (zv_filled < zv_N) { zv_filled++; }
+            float v_delayed = (zv_filled >= zv_N) ? v_old : 0.0f;
+            float v_shaped  = zv_A1 * v_now + zv_A2 * v_delayed;
+            if (v_shaped > 0.0f) {
+                timerTicks = uint32_t(ceilf(float(timerTicks) * v_now / v_shaped));
+            }
+        }
+
         // isrPeriod is stored as 16 bits, so limit timerTicks to the
         // largest value that will fit in a uint16_t.
         prep_segment->isrPeriod = timerTicks > 0xffff ? 0xffff : timerTicks;

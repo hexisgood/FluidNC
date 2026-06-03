@@ -33,6 +33,9 @@ namespace Stepper {
     // Initialize backlash compensation from axis config
     void init_backlash();
 
+    // Initialize ZV input shaping from axis config (called by init_backlash)
+    void init_input_shaping();
+
     // Changes the run state of the step segment buffer to execute the special parking motion.
     void parking_setup_buffer();
 

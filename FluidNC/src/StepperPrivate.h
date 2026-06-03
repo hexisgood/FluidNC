@@ -38,3 +38,6 @@ struct PrepFlag {
 
 const uint32_t amassThreshold = Machine::Stepping::fStepperTimer / 8000;
 const int      maxAmassLevel  = 3;  // Each level increase doubles the threshold
+
+// ZV input shaping: delay buffer capacity (covers resonances down to ~3 Hz at 100 Hz segment rate)
+const int ZV_BUF_MAX = 16;

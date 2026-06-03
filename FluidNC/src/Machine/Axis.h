@@ -36,8 +36,10 @@ namespace Machine {
         float _maxTravel    = 1000.0f;
         bool  _softLimits   = false;
         bool  _idleDisable  = true;
-        float _backlash     = 0.0f;  // backlash compensation in mm (0 = disabled)
-        float _jerk         = 0.0f;  // jerk limit in mm/s³ (0 = trapezoidal, no S-curve)
+        float _backlash          = 0.0f;   // backlash compensation in mm (0 = disabled)
+        float _jerk              = 0.0f;   // jerk limit in mm/s³ (0 = trapezoidal, no S-curve)
+        float _shaping_freq_hz   = 0.0f;   // ZV input shaping resonant frequency in Hz (0 = disabled)
+        float _shaping_zeta      = 0.05f;  // ZV input shaping damping ratio
 
         // Configuration system helpers:
         void group(Configuration::HandlerBase& handler) override;

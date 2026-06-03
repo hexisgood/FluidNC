@@ -14,6 +14,8 @@ namespace Machine {
         handler.item("idle_disable", _idleDisable);
         handler.item("backlash_mm", _backlash, 0.0, 10.0);
         handler.item("jerk_mm_per_sec3", _jerk, 0.0, 1000000.0);
+        handler.item("shaping_freq_hz", _shaping_freq_hz, 0.0, 500.0);
+        handler.item("shaping_zeta", _shaping_zeta, 0.0, 1.0);
         handler.section("homing", _homing);
 
         char tmp[7];
