@@ -94,6 +94,9 @@ static AxisMask  last_dir_bits                    = 0;
 static bool      dir_valid                        = false;
 static uint32_t  backlash_steps_cfg[MAX_N_AXIS]   = {};
 
+// Set true during mc_arc() so planner-level arc correction handles backlash instead
+bool in_arc_move = false;
+
 // Segment preparation data struct. Contains all the necessary information to compute new segments
 // based on the current executing planner block.
 typedef struct {
@@ -469,7 +472,8 @@ void Stepper::prep_buffer() {
                     auto n_axis_bl = Axes::_numberAxis;
                     for (axis_t axis = X_AXIS; axis < n_axis_bl; axis++) {
                         bool moving   = pl_block->steps[axis] > 0;
-                        bool reversed = moving
+                        bool reversed = !in_arc_move
+                                     && moving
                                      && dir_valid
                                      && backlash_steps_cfg[axis] > 0
                                      && bitnum_is_true(pl_block->direction_bits ^ last_dir_bits, axis);

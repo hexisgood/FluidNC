@@ -28,6 +28,9 @@
 // this is needed if a jogCancel comes along after we have already parsed a jog and it is in-flight.
 static volatile void* mc_pl_data_inflight;  // holds a plan_line_data_t while mc_move_motors has taken ownership of a line motion
 
+// Defined in Stepper.cpp; suppresses reactive backlash injection during arc moves
+extern bool in_arc_move;
+
 void mc_init() {
     mc_pl_data_inflight = NULL;
 }
@@ -179,6 +182,9 @@ void mc_arc(float*            target,
     // For most uses, this value should not exceed 2000.
     uint16_t segments =
         uint16_t(floorf(fabsf(0.5F * angular_travel * radius) / sqrtf(config->_arcTolerance * (2 * radius - config->_arcTolerance))));
+
+    // Suppress stepper-level reactive backlash during the arc; corrections are woven into segments below.
+    in_arc_move = true;
     if (segments) {
         // Multiply inverse feed_rate to compensate for the fact that this movement is approximated
         // by a number of discrete segments. The inverse feed_rate should be correct for the sum of
@@ -193,6 +199,50 @@ void mc_arc(float*            target,
         for (size_t i = A_AXIS; i < n_axis; i++) {
             linear_per_segment[i] = (target[i] - position[i]) / segments;
         }
+
+        // --- Arc backlash correction setup ---
+        // For each quadrant crossing within the arc's angular range, we distribute the
+        // backlash correction over a 5° spread immediately after the crossing.  This fills
+        // the drive's dead zone smoothly while Y (or X) continues at full velocity.
+        static const float kBLSpread = (5.0f / 180.0f) * float(M_PI);  // 5° in radians
+        static const int   kMaxCross = 16;
+        struct ArcBLCrossing { float angle; int plane_idx; float correction; float prev_frac; };
+        ArcBLCrossing crossings[kMaxCross];
+        int   num_cross   = 0;
+        float start_angle = 0.0f;
+        {
+            float bl[2] = { 0.0f, 0.0f };
+            if (axis_0 < Axes::_numberAxis && Axes::_axis[axis_0])
+                bl[0] = Axes::_axis[axis_0]->_backlash;
+            if (axis_1 < Axes::_numberAxis && Axes::_axis[axis_1])
+                bl[1] = Axes::_axis[axis_1]->_backlash;
+
+            if (bl[0] > 0.0f || bl[1] > 0.0f) {
+                start_angle    = atan2f(radii[1], radii[0]);
+                float end_angle = start_angle + angular_travel;
+                float lo        = fminf(start_angle, end_angle);
+                float hi        = fmaxf(start_angle, end_angle);
+                float tps_sign  = (theta_per_segment > 0.0f) ? 1.0f : -1.0f;
+
+                // X crossings at n*π (axis_0 reverses); Y crossings at π/2+n*π (axis_1 reverses).
+                // correction_sign = direction axis moves AFTER crossing = -sign(cos/sin(C)) * sign(tps)
+                for (int type = 0; type < 2; type++) {
+                    if (bl[type] <= 0.0f) continue;
+                    float base = (type == 0) ? 0.0f : float(M_PI) * 0.5f;
+                    int n_lo   = (int)ceilf((lo - base) / float(M_PI));
+                    int n_hi   = (int)floorf((hi - base) / float(M_PI));
+                    for (int n = n_lo; n <= n_hi && num_cross < kMaxCross; n++) {
+                        float C = base + n * float(M_PI);
+                        if (C < lo || C > hi) continue;
+                        float cv       = (type == 0) ? cosf(C) : sinf(C);
+                        float corr_sgn = (cv > 0.0f ? -1.0f : 1.0f) * tps_sign;
+                        crossings[num_cross++] = { C, type, corr_sgn * bl[type], 0.0f };
+                    }
+                }
+            }
+        }
+        // --- End arc backlash correction setup ---
+
         /* Vector rotation by transformation matrix: r is the original vector, r_T is the rotated vector,
            and phi is the angle of rotation. Solution approach by Jens Geisler.
                r_T = [cos(phi) -sin(phi);
@@ -250,6 +300,27 @@ void mc_arc(float*            target,
             for (size_t i = A_AXIS; i < n_axis; i++) {
                 position[i] += linear_per_segment[i];
             }
+
+            // Arc backlash: apply incremental correction in the post-crossing spread zone.
+            // Each segment in [crossing, crossing+kBLSpread] gets a half-sine slice of backlash_mm.
+            if (num_cross > 0) {
+                float seg_angle = start_angle + float(i) * theta_per_segment;
+                float tps_sign  = (theta_per_segment > 0.0f) ? 1.0f : -1.0f;
+                for (int ci = 0; ci < num_cross; ci++) {
+                    float delta = (seg_angle - crossings[ci].angle) * tps_sign;
+                    if (delta > 0.0f && delta <= kBLSpread) {
+                        float t    = delta / kBLSpread;
+                        float frac = 0.5f * (1.0f - cosf(float(M_PI) * t));
+                        float df   = frac - crossings[ci].prev_frac;
+                        crossings[ci].prev_frac = frac;
+                        if (crossings[ci].plane_idx == 0)
+                            position[axis_0] += crossings[ci].correction * df;
+                        else
+                            position[axis_1] += crossings[ci].correction * df;
+                    }
+                }
+            }
+
             pl_data->feed_rate = original_feedrate;  // This restores the feedrate kinematics may have altered
             mc_linear(position, pl_data, previous_position);
             previous_position[axis_0]      = position[axis_0];
@@ -264,6 +335,7 @@ void mc_arc(float*            target,
     }
     // Ensure last segment arrives at target location.
     mc_linear(target, pl_data, previous_position);
+    in_arc_move = false;
 }
 
 // Execute dwell in seconds.
