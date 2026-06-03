@@ -95,6 +95,23 @@ float limit_acceleration_by_axis_maximum(float* unit_vec) {
     return limit_value * secPerMinSq;
 }
 
+const float secPerMinCubed = 60.0 * 60.0 * 60.0;  // for jerk unit conversion mm/s³ → mm/min³
+
+float limit_jerk_by_axis_maximum(float* unit_vec) {
+    float limit_value = SOME_LARGE_VALUE;
+    auto  n_axis      = Axes::_numberAxis;
+    for (axis_t axis = X_AXIS; axis < n_axis; axis++) {
+        auto axisSetting = Axes::_axis[axis];
+        if (unit_vec[axis] != 0 && axisSetting->_jerk > 0) {
+            limit_value = MIN(limit_value, fabsf(axisSetting->_jerk / unit_vec[axis]));
+        }
+    }
+    if (limit_value == SOME_LARGE_VALUE) {
+        return 0.0f;  // no axis has jerk configured → trapezoidal
+    }
+    return limit_value * secPerMinCubed;
+}
+
 float limit_rate_by_axis_maximum(float* unit_vec) {
     float limit_value = SOME_LARGE_VALUE;
     auto  n_axis      = Axes::_numberAxis;

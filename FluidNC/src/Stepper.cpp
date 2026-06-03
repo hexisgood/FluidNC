@@ -122,6 +122,21 @@ typedef struct {
     float accelerate_until;  // Acceleration ramp end measured from end of block (mm)
     float decelerate_after;  // Deceleration ramp start measured from end of block (mm)
 
+    // S-curve fields — only valid when ramp_type is RAMP_SC_P*
+    float sc_jerk;       // mm/min³; copied from pl_block->jerk
+    float current_accel; // instantaneous acceleration magnitude (mm/min²)
+    float sc_a_peak_a;   // peak acceleration reached in accel half (mm/min²)
+    float sc_a_peak_d;   // peak acceleration reached in decel half (mm/min²)
+    float sc_v_end_ph1;  // speed at end of phase 1 (mm/min)
+    float sc_v_bef_ph3;  // speed at start of phase 3 (mm/min)
+    float sc_v_end_ph5;  // speed at end of phase 5 (mm/min)
+    float sc_v_bef_ph7;  // speed at start of phase 7 (mm/min)
+    float sc_j_time_a;   // jerk-phase duration for accel half (min)
+    float sc_t_ph2;      // constant-accel phase duration (min)
+    float sc_j_time_d;   // jerk-phase duration for decel half (min)
+    float sc_t_ph6;      // constant-decel phase duration (min)
+    float sc_phase_rem;  // time remaining in current S-curve phase (min)
+
     float        inv_rate;  // Used by PWM laser mode to speed up segment calculations.
     SpindleSpeed current_spindle_speed;
 
@@ -495,6 +510,7 @@ void Stepper::prep_buffer() {
                 prep.step_per_mm      = prep.steps_remaining / pl_block->millimeters;
                 prep.req_mm_increment = REQ_MM_INCREMENT_SCALAR / prep.step_per_mm;
                 prep.dt_remainder     = 0.0;  // Reset for new segment block
+                prep.sc_jerk          = 0.0f;  // cleared every block; set if S-curve is used
                 if ((sys.step_control.executeHold) || prep.recalculate_flag.decelOverride) {
                     // New block loaded mid-hold. Override planner block entry speed to enforce deceleration.
                     prep.current_speed                  = prep.exit_speed;
@@ -549,54 +565,117 @@ void Stepper::prep_buffer() {
                     prep.exit_speed = sqrtf(exit_speed_sqr);
                 }
 
-                nominal_speed            = plan_compute_profile_nominal_speed(pl_block);
-                float nominal_speed_sqr  = nominal_speed * nominal_speed;
-                float intersect_distance = 0.5f * (pl_block->millimeters + inv_2_accel * (pl_block->entry_speed_sqr - exit_speed_sqr));
-                if (pl_block->entry_speed_sqr > nominal_speed_sqr) {  // Only occurs during override reductions.
-                    prep.accelerate_until = pl_block->millimeters - inv_2_accel * (pl_block->entry_speed_sqr - nominal_speed_sqr);
-                    if (prep.accelerate_until <= 0.0) {  // Deceleration-only.
-                        prep.ramp_type = RAMP_DECEL;
-                        // prep.decelerate_after = pl_block->millimeters;
-                        // prep.maximum_speed = prep.current_speed;
-                        // Compute override block exit speed since it doesn't match the planner exit speed.
-                        prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2 * pl_block->acceleration * pl_block->millimeters);
-                        prep.recalculate_flag.decelOverride = 1;  // Flag to load next block as deceleration override.
-                        // TODO: Determine correct handling of parameters in deceleration-only.
-                        // Can be tricky since entry speed will be current speed, as in feed holds.
-                        // Also, look into near-zero speed handling issues with this.
+                nominal_speed           = plan_compute_profile_nominal_speed(pl_block);
+                float nominal_speed_sqr = nominal_speed * nominal_speed;
+
+                // S-curve path: attempt 7-phase profile when jerk is configured and not override reduction
+                bool use_scurve = false;
+                if (pl_block->jerk > 0.0f && pl_block->entry_speed_sqr <= nominal_speed_sqr) {
+                    float J      = pl_block->jerk;
+                    float v0     = prep.current_speed;
+                    float v1     = prep.exit_speed;
+                    float a      = pl_block->acceleration;
+                    float D      = pl_block->millimeters;
+                    float T_j    = a / J;         // single jerk-phase duration (min)
+                    float dv_j   = a * T_j;       // = a²/J, Δv for full jerk pair
+
+                    // Accel half (v0 → nominal_speed)
+                    float dv_a = nominal_speed - v0;
+                    float a_peak_a, T_j_a, T_a2;
+                    if (dv_a <= 0.0f) {
+                        a_peak_a = 0.0f; T_j_a = 0.0f; T_a2 = 0.0f;
+                    } else if (dv_a >= dv_j) {
+                        a_peak_a = a; T_j_a = T_j; T_a2 = (dv_a - dv_j) / a;
                     } else {
-                        // Decelerate to cruise or cruise-decelerate types. Guaranteed to intersect updated plan.
-                        prep.decelerate_after = inv_2_accel * (nominal_speed_sqr - exit_speed_sqr);
+                        a_peak_a = sqrtf(J * dv_a); T_j_a = a_peak_a / J; T_a2 = 0.0f;
+                    }
+                    float v_end_ph1  = v0 + 0.5f * a_peak_a * T_j_a;
+                    float v_bef_ph3  = nominal_speed - 0.5f * a_peak_a * T_j_a;
+                    float d1 = v0 * T_j_a + a_peak_a * T_j_a * T_j_a / 6.0f;
+                    float d2 = v_end_ph1 * T_a2 + 0.5f * a_peak_a * T_a2 * T_a2;
+                    float d3 = v_bef_ph3 * T_j_a + a_peak_a * T_j_a * T_j_a / 3.0f;
+
+                    // Decel half (nominal_speed → v1)
+                    float dv_d = nominal_speed - v1;
+                    float a_peak_d, T_j_d, T_d6;
+                    if (dv_d <= 0.0f) {
+                        a_peak_d = 0.0f; T_j_d = 0.0f; T_d6 = 0.0f;
+                    } else if (dv_d >= dv_j) {
+                        a_peak_d = a; T_j_d = T_j; T_d6 = (dv_d - dv_j) / a;
+                    } else {
+                        a_peak_d = sqrtf(J * dv_d); T_j_d = a_peak_d / J; T_d6 = 0.0f;
+                    }
+                    float v_end_ph5  = nominal_speed - 0.5f * a_peak_d * T_j_d;
+                    float v_bef_ph7  = v1 + 0.5f * a_peak_d * T_j_d;
+                    float d5 = nominal_speed * T_j_d - a_peak_d * T_j_d * T_j_d / 6.0f;
+                    float d6 = v_end_ph5 * T_d6 - 0.5f * a_peak_d * T_d6 * T_d6;
+                    float d7 = v_bef_ph7 * T_j_d - a_peak_d * T_j_d * T_j_d / 3.0f;
+
+                    if (d1 + d2 + d3 + d5 + d6 + d7 <= D) {
+                        use_scurve = true;
+                        prep.accelerate_until = D - (d1 + d2 + d3);
+                        prep.decelerate_after = d5 + d6 + d7;
                         prep.maximum_speed    = nominal_speed;
-                        prep.ramp_type        = RAMP_DECEL_OVERRIDE;
-                    }
-                } else if (intersect_distance > 0.0) {
-                    if (intersect_distance < pl_block->millimeters) {  // Either trapezoid or triangle types
-                        // NOTE: For acceleration-cruise and cruise-only types, following calculation will be 0.0.
-                        prep.decelerate_after = inv_2_accel * (nominal_speed_sqr - exit_speed_sqr);
-                        if (prep.decelerate_after < intersect_distance) {  // Trapezoid type
-                            prep.maximum_speed = nominal_speed;
-                            if (pl_block->entry_speed_sqr == nominal_speed_sqr) {
-                                // Cruise-deceleration or cruise-only type.
-                                prep.ramp_type = RAMP_CRUISE;
-                            } else {
-                                // Full-trapezoid or acceleration-cruise types
-                                prep.accelerate_until -= inv_2_accel * (nominal_speed_sqr - pl_block->entry_speed_sqr);
-                            }
-                        } else {  // Triangle type
-                            prep.accelerate_until = intersect_distance;
-                            prep.decelerate_after = intersect_distance;
-                            prep.maximum_speed    = sqrtf(2.0f * pl_block->acceleration * intersect_distance + exit_speed_sqr);
+                        prep.mm_complete      = 0.0f;
+                        prep.sc_jerk          = J;
+                        prep.current_accel    = 0.0f;
+                        prep.sc_a_peak_a      = a_peak_a;
+                        prep.sc_a_peak_d      = a_peak_d;
+                        prep.sc_v_end_ph1     = v_end_ph1;
+                        prep.sc_v_bef_ph3     = v_bef_ph3;
+                        prep.sc_v_end_ph5     = v_end_ph5;
+                        prep.sc_v_bef_ph7     = v_bef_ph7;
+                        prep.sc_j_time_a      = T_j_a;
+                        prep.sc_t_ph2         = T_a2;
+                        prep.sc_j_time_d      = T_j_d;
+                        prep.sc_t_ph6         = T_d6;
+                        if (dv_a <= 0.0f) {
+                            prep.ramp_type    = (dv_d > 0.0f) ? RAMP_SC_P5 : RAMP_CRUISE;
+                            prep.sc_phase_rem = (dv_d > 0.0f) ? T_j_d : 0.0f;
+                        } else {
+                            prep.ramp_type    = RAMP_SC_P1;
+                            prep.sc_phase_rem = T_j_a;
                         }
-                    } else {  // Deceleration-only type
-                        prep.ramp_type = RAMP_DECEL;
-                        // prep.decelerate_after = pl_block->millimeters;
-                        // prep.maximum_speed = prep.current_speed;
                     }
-                } else {  // Acceleration-only type
-                    prep.accelerate_until = 0.0;
-                    // prep.decelerate_after = 0.0;
-                    prep.maximum_speed = prep.exit_speed;
+                }
+
+                if (!use_scurve) {
+                    // Trapezoidal profile (existing logic)
+                    float intersect_distance = 0.5f * (pl_block->millimeters + inv_2_accel * (pl_block->entry_speed_sqr - exit_speed_sqr));
+                    if (pl_block->entry_speed_sqr > nominal_speed_sqr) {  // Only occurs during override reductions.
+                        prep.accelerate_until = pl_block->millimeters - inv_2_accel * (pl_block->entry_speed_sqr - nominal_speed_sqr);
+                        if (prep.accelerate_until <= 0.0) {  // Deceleration-only.
+                            prep.ramp_type = RAMP_DECEL;
+                            prep.exit_speed = sqrtf(pl_block->entry_speed_sqr - 2 * pl_block->acceleration * pl_block->millimeters);
+                            prep.recalculate_flag.decelOverride = 1;
+                        } else {
+                            // Decelerate to cruise or cruise-decelerate types.
+                            prep.decelerate_after = inv_2_accel * (nominal_speed_sqr - exit_speed_sqr);
+                            prep.maximum_speed    = nominal_speed;
+                            prep.ramp_type        = RAMP_DECEL_OVERRIDE;
+                        }
+                    } else if (intersect_distance > 0.0) {
+                        if (intersect_distance < pl_block->millimeters) {  // Either trapezoid or triangle types
+                            prep.decelerate_after = inv_2_accel * (nominal_speed_sqr - exit_speed_sqr);
+                            if (prep.decelerate_after < intersect_distance) {  // Trapezoid type
+                                prep.maximum_speed = nominal_speed;
+                                if (pl_block->entry_speed_sqr == nominal_speed_sqr) {
+                                    prep.ramp_type = RAMP_CRUISE;
+                                } else {
+                                    prep.accelerate_until -= inv_2_accel * (nominal_speed_sqr - pl_block->entry_speed_sqr);
+                                }
+                            } else {  // Triangle type
+                                prep.accelerate_until = intersect_distance;
+                                prep.decelerate_after = intersect_distance;
+                                prep.maximum_speed    = sqrtf(2.0f * pl_block->acceleration * intersect_distance + exit_speed_sqr);
+                            }
+                        } else {  // Deceleration-only type
+                            prep.ramp_type = RAMP_DECEL;
+                        }
+                    } else {  // Acceleration-only type
+                        prep.accelerate_until = 0.0;
+                        prep.maximum_speed    = prep.exit_speed;
+                    }
                 }
             }
 
@@ -678,11 +757,131 @@ void Stepper::prep_buffer() {
                         // Cruise-deceleration junction or end of block.
                         time_var       = (mm_remaining - prep.decelerate_after) / prep.maximum_speed;
                         mm_remaining   = prep.decelerate_after;  // NOTE: 0.0 at EOB
-                        prep.ramp_type = RAMP_DECEL;
+                        if (prep.sc_jerk > 0.0f && prep.sc_j_time_d > 0.0f) {
+                            prep.ramp_type     = RAMP_SC_P5;
+                            prep.sc_phase_rem  = prep.sc_j_time_d;
+                            prep.current_accel = 0.0f;
+                        } else {
+                            prep.ramp_type = RAMP_DECEL;
+                        }
                     } else {  // Cruising only.
                         mm_remaining = mm_var;
                     }
                     break;
+                case RAMP_SC_P1: {
+                    // Jerk-up: acceleration 0 → sc_a_peak_a
+                    float t  = (time_var >= prep.sc_phase_rem) ? prep.sc_phase_rem : time_var;
+                    float da = prep.sc_jerk * t;
+                    speed_var = prep.current_accel * t + 0.5f * da * t;
+                    mm_remaining -= t * (prep.current_speed + 0.5f * speed_var);
+                    if (time_var >= prep.sc_phase_rem) {
+                        prep.current_speed = prep.sc_v_end_ph1;
+                        prep.current_accel = prep.sc_a_peak_a;
+                        time_var = t;
+                        if (prep.sc_t_ph2 > 0.0f) {
+                            prep.ramp_type = RAMP_SC_P2; prep.sc_phase_rem = prep.sc_t_ph2;
+                        } else {
+                            prep.ramp_type = RAMP_SC_P3; prep.sc_phase_rem = prep.sc_j_time_a;
+                        }
+                    } else {
+                        prep.current_speed += speed_var;
+                        prep.current_accel  = MIN(prep.current_accel + da, prep.sc_a_peak_a);
+                        prep.sc_phase_rem  -= t;
+                    }
+                    break;
+                }
+                case RAMP_SC_P2: {
+                    // Constant acceleration at sc_a_peak_a
+                    float t = (time_var >= prep.sc_phase_rem) ? prep.sc_phase_rem : time_var;
+                    speed_var = prep.sc_a_peak_a * t;
+                    mm_remaining -= t * (prep.current_speed + 0.5f * speed_var);
+                    if (time_var >= prep.sc_phase_rem) {
+                        prep.current_speed = prep.sc_v_bef_ph3;
+                        time_var = t;
+                        prep.ramp_type = RAMP_SC_P3; prep.sc_phase_rem = prep.sc_j_time_a;
+                    } else {
+                        prep.current_speed += speed_var;
+                        prep.sc_phase_rem  -= t;
+                    }
+                    break;
+                }
+                case RAMP_SC_P3: {
+                    // Jerk-down: acceleration sc_a_peak_a → 0 (approaching cruise)
+                    float t  = (time_var >= prep.sc_phase_rem) ? prep.sc_phase_rem : time_var;
+                    float da = prep.sc_jerk * t;
+                    speed_var = prep.current_accel * t - 0.5f * da * t;
+                    mm_remaining -= t * (prep.current_speed + 0.5f * speed_var);
+                    if (time_var >= prep.sc_phase_rem) {
+                        prep.current_speed = prep.maximum_speed;
+                        prep.current_accel = 0.0f;
+                        time_var = t;
+                        if (prep.accelerate_until == prep.decelerate_after && prep.sc_j_time_d > 0.0f) {
+                            prep.ramp_type = RAMP_SC_P5; prep.sc_phase_rem = prep.sc_j_time_d;
+                        } else {
+                            prep.ramp_type = RAMP_CRUISE;
+                        }
+                    } else {
+                        prep.current_speed += speed_var;
+                        prep.current_accel  = MAX(prep.current_accel - da, 0.0f);
+                        prep.sc_phase_rem  -= t;
+                    }
+                    break;
+                }
+                case RAMP_SC_P5: {
+                    // Jerk-up: deceleration 0 → sc_a_peak_d
+                    float t  = (time_var >= prep.sc_phase_rem) ? prep.sc_phase_rem : time_var;
+                    float da = prep.sc_jerk * t;
+                    speed_var = prep.current_accel * t + 0.5f * da * t;
+                    mm_remaining -= t * (prep.current_speed - 0.5f * speed_var);
+                    if (time_var >= prep.sc_phase_rem) {
+                        prep.current_speed = prep.sc_v_end_ph5;
+                        prep.current_accel = prep.sc_a_peak_d;
+                        time_var = t;
+                        if (prep.sc_t_ph6 > 0.0f) {
+                            prep.ramp_type = RAMP_SC_P6; prep.sc_phase_rem = prep.sc_t_ph6;
+                        } else {
+                            prep.ramp_type = RAMP_SC_P7; prep.sc_phase_rem = prep.sc_j_time_d;
+                        }
+                    } else {
+                        prep.current_speed -= speed_var;
+                        prep.current_accel  = MIN(prep.current_accel + da, prep.sc_a_peak_d);
+                        prep.sc_phase_rem  -= t;
+                    }
+                    break;
+                }
+                case RAMP_SC_P6: {
+                    // Constant deceleration at sc_a_peak_d
+                    float t = (time_var >= prep.sc_phase_rem) ? prep.sc_phase_rem : time_var;
+                    speed_var = prep.sc_a_peak_d * t;
+                    mm_remaining -= t * (prep.current_speed - 0.5f * speed_var);
+                    if (time_var >= prep.sc_phase_rem) {
+                        prep.current_speed = prep.sc_v_bef_ph7;
+                        time_var = t;
+                        prep.ramp_type = RAMP_SC_P7; prep.sc_phase_rem = prep.sc_j_time_d;
+                    } else {
+                        prep.current_speed -= speed_var;
+                        prep.sc_phase_rem  -= t;
+                    }
+                    break;
+                }
+                case RAMP_SC_P7: {
+                    // Jerk-down: deceleration sc_a_peak_d → 0 (approaching exit speed)
+                    float t  = (time_var >= prep.sc_phase_rem) ? prep.sc_phase_rem : time_var;
+                    float da = prep.sc_jerk * t;
+                    speed_var = prep.current_accel * t - 0.5f * da * t;
+                    mm_remaining -= t * (prep.current_speed - 0.5f * speed_var);
+                    if (time_var >= prep.sc_phase_rem) {
+                        prep.current_speed = prep.exit_speed;
+                        prep.current_accel = 0.0f;
+                        mm_remaining       = prep.mm_complete;  // force exact block termination
+                        time_var = t;
+                    } else {
+                        prep.current_speed -= speed_var;
+                        prep.current_accel  = MAX(prep.current_accel - da, 0.0f);
+                        prep.sc_phase_rem  -= t;
+                    }
+                    break;
+                }
                 default:  // case RAMP_DECEL:
                     // NOTE: mm_var used as a misc worker variable to prevent errors when near zero speed.
                     speed_var = pl_block->acceleration * time_var;  // Used as delta speed (mm/min)

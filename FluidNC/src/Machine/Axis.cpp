@@ -13,6 +13,7 @@ namespace Machine {
         handler.item("soft_limits", _softLimits);
         handler.item("idle_disable", _idleDisable);
         handler.item("backlash_mm", _backlash, 0.0, 10.0);
+        handler.item("jerk_mm_per_sec3", _jerk, 0.0, 1000000.0);
         handler.section("homing", _homing);
 
         char tmp[7];

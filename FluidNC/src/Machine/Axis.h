@@ -37,6 +37,7 @@ namespace Machine {
         bool  _softLimits   = false;
         bool  _idleDisable  = true;
         float _backlash     = 0.0f;  // backlash compensation in mm (0 = disabled)
+        float _jerk         = 0.0f;  // jerk limit in mm/s³ (0 = trapezoidal, no S-curve)
 
         // Configuration system helpers:
         void group(Configuration::HandlerBase& handler) override;

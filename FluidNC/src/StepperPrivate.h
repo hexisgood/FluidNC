@@ -10,6 +10,13 @@ const int   RAMP_ACCEL              = 0;
 const int   RAMP_CRUISE             = 1;
 const int   RAMP_DECEL              = 2;
 const int   RAMP_DECEL_OVERRIDE     = 3;
+// S-curve ramp phases (only active when pl_block->jerk > 0)
+const int   RAMP_SC_P1              = 4;  // jerk-up: acceleration 0 → a_peak
+const int   RAMP_SC_P2              = 5;  // constant acceleration at a_peak
+const int   RAMP_SC_P3              = 6;  // jerk-down: acceleration a_peak → 0 (approaching cruise)
+const int   RAMP_SC_P5              = 7;  // jerk-up: deceleration 0 → a_peak
+const int   RAMP_SC_P6              = 8;  // constant deceleration at a_peak
+const int   RAMP_SC_P7              = 9;  // jerk-down: deceleration a_peak → 0 (approaching exit)
 
 struct PrepFlag {
     uint8_t recalculate : 1;
